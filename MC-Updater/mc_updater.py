@@ -3,6 +3,7 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import stat
 import sys
 import tarfile
@@ -10,6 +11,8 @@ import traceback
 import urllib.request
 import zipfile
 from pathlib import Path
+
+import certifi
 
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -69,6 +72,10 @@ def current_platform():
     raise RuntimeError(f"Unsupported operating system: {platform.system()}")
 
 
+def get_ssl_context():
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def normalize_version(value):
     text = str(value or "").strip()
     match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", text, re.IGNORECASE)
@@ -113,7 +120,11 @@ def github_api_json(url):
         },
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=30,
+        context=get_ssl_context(),
+    ) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -286,7 +297,11 @@ class UpdateWorker(QThread):
             },
         )
 
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=60,
+            context=get_ssl_context(),
+        ) as response:
             total_size = int(response.headers.get("Content-Length", 0))
             downloaded = 0
 
