@@ -1,7 +1,11 @@
 import json
+import os
+import platform
 import re
 import shutil
+import stat
 import sys
+import tarfile
 import traceback
 import urllib.request
 import zipfile
@@ -25,10 +29,13 @@ GITHUB_OWNER = "Anime0t4ku"
 GITHUB_REPO = "mister-companion"
 
 CONFIG_FILE = "config.json"
-TARGET_EXE = "MiSTer-Companion.exe"
 UPDATE_NOW_FILE = "updatenow.txt"
 
+WINDOWS_TARGET_EXE = "MiSTer-Companion.exe"
+LINUX_TARGET_EXE = "MiSTer-Companion"
+
 WINDOWS_ZIP_KEYWORDS = ["Windows", "x86_64", ".zip"]
+LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
 
 INCLUDE_PRERELEASES = True
 
@@ -38,6 +45,28 @@ def app_folder():
         return Path(sys.executable).resolve().parent
 
     return Path(__file__).resolve().parent
+
+
+def current_platform():
+    system = platform.system().lower()
+
+    if system == "windows":
+        return {
+            "name": "Windows",
+            "target_exe": WINDOWS_TARGET_EXE,
+            "asset_keywords": WINDOWS_ZIP_KEYWORDS,
+            "archive_type": "zip",
+        }
+
+    if system == "linux":
+        return {
+            "name": "Linux",
+            "target_exe": LINUX_TARGET_EXE,
+            "asset_keywords": LINUX_TAR_KEYWORDS,
+            "archive_type": "tar.gz",
+        }
+
+    raise RuntimeError(f"Unsupported operating system: {platform.system()}")
 
 
 def normalize_version(value):
@@ -88,17 +117,17 @@ def github_api_json(url):
         return json.loads(response.read().decode("utf-8"))
 
 
-def asset_is_windows_zip(asset_name):
+def asset_matches_platform(asset_name, platform_info):
     lowered = asset_name.lower()
 
-    for keyword in WINDOWS_ZIP_KEYWORDS:
+    for keyword in platform_info["asset_keywords"]:
         if keyword.lower() not in lowered:
             return False
 
     return True
 
 
-def find_latest_release():
+def find_latest_release(platform_info):
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
     releases = github_api_json(url)
 
@@ -124,26 +153,42 @@ def find_latest_release():
             continue
 
         assets = release.get("assets", [])
-        windows_asset = None
+        matching_asset = None
 
         for asset in assets:
             asset_name = asset.get("name", "")
-            if asset_is_windows_zip(asset_name):
-                windows_asset = asset
+            if asset_matches_platform(asset_name, platform_info):
+                matching_asset = asset
                 break
 
-        if not windows_asset:
+        if not matching_asset:
             continue
 
         if best_version is None or version > best_version:
             best_release = release
             best_version = version
-            best_asset = windows_asset
+            best_asset = matching_asset
 
     if not best_release or not best_version or not best_asset:
-        raise RuntimeError("Could not find a valid MiSTer Companion Windows release asset.")
+        raise RuntimeError(
+            f"Could not find a valid MiSTer Companion {platform_info['name']} release asset."
+        )
 
     return best_release, best_version, best_asset
+
+
+def make_executable(path):
+    if not path.exists():
+        raise FileNotFoundError(f"{path.name} was not found after extraction.")
+
+    current_mode = os.stat(path).st_mode
+    os.chmod(
+        path,
+        current_mode
+        | stat.S_IXUSR
+        | stat.S_IXGRP
+        | stat.S_IXOTH,
+    )
 
 
 class UpdateWorker(QThread):
@@ -155,6 +200,7 @@ class UpdateWorker(QThread):
     def __init__(self):
         super().__init__()
         self.base_path = app_folder()
+        self.platform_info = current_platform()
 
     def log(self, message):
         self.status_changed.emit(message)
@@ -163,12 +209,14 @@ class UpdateWorker(QThread):
         try:
             self.progress_changed.emit(0)
 
+            self.log(f"Detected platform: {self.platform_info['name']}")
+
             self.log("Reading installed version...")
             current_version_text, current_version = read_current_version(self.base_path)
             self.log(f"Installed version: {current_version_text}")
 
             self.log("Checking GitHub releases...")
-            release, latest_version, asset = find_latest_release()
+            release, latest_version, asset = find_latest_release(self.platform_info)
             latest_version_text = version_to_text(latest_version)
             self.log(f"Latest version: {latest_version_text}")
 
@@ -183,30 +231,43 @@ class UpdateWorker(QThread):
             if not download_url:
                 raise RuntimeError("The release asset does not have a download URL.")
 
-            zip_path = self.base_path / asset_name
-            exe_path = self.base_path / TARGET_EXE
+            archive_path = self.base_path / asset_name
+            target_path = self.base_path / self.platform_info["target_exe"]
 
             self.log(f"Downloading {asset_name}...")
-            self.download_file(download_url, zip_path)
+            self.download_file(download_url, archive_path)
             self.progress_changed.emit(45)
 
-            if exe_path.exists():
-                self.log(f"Removing old {TARGET_EXE}...")
+            if target_path.exists():
+                self.log(f"Removing old {self.platform_info['target_exe']}...")
                 try:
-                    exe_path.unlink()
+                    target_path.unlink()
                 except PermissionError:
                     raise PermissionError(
-                        f"Could not remove {TARGET_EXE}. "
+                        f"Could not remove {self.platform_info['target_exe']}. "
                         "Please make sure MiSTer Companion is closed and try again."
                     )
 
             self.log("Extracting update...")
-            self.extract_zip(zip_path, self.base_path)
+
+            if self.platform_info["archive_type"] == "zip":
+                self.extract_zip(archive_path, self.base_path)
+            elif self.platform_info["archive_type"] == "tar.gz":
+                self.extract_tar_gz(archive_path, self.base_path)
+            else:
+                raise RuntimeError(
+                    f"Unsupported archive type: {self.platform_info['archive_type']}"
+                )
+
             self.progress_changed.emit(85)
 
-            self.log("Removing downloaded zip file...")
+            if self.platform_info["name"] == "Linux":
+                self.log("Making Linux executable runnable...")
+                make_executable(target_path)
+
+            self.log("Removing downloaded archive file...")
             try:
-                zip_path.unlink()
+                archive_path.unlink()
             except Exception:
                 pass
 
@@ -248,6 +309,9 @@ class UpdateWorker(QThread):
             for member in zip_file.infolist():
                 extracted_path = destination / member.filename
 
+                if not self.is_safe_extract_path(destination, extracted_path):
+                    raise RuntimeError(f"Unsafe path found in archive: {member.filename}")
+
                 if member.is_dir():
                     extracted_path.mkdir(parents=True, exist_ok=True)
                     continue
@@ -257,6 +321,39 @@ class UpdateWorker(QThread):
                 with zip_file.open(member, "r") as source:
                     with open(extracted_path, "wb") as target:
                         shutil.copyfileobj(source, target)
+
+    def extract_tar_gz(self, tar_path, destination):
+        with tarfile.open(tar_path, "r:gz") as tar_file:
+            for member in tar_file.getmembers():
+                extracted_path = destination / member.name
+
+                if not self.is_safe_extract_path(destination, extracted_path):
+                    raise RuntimeError(f"Unsafe path found in archive: {member.name}")
+
+                if member.isdir():
+                    extracted_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                if member.isfile():
+                    extracted_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    source = tar_file.extractfile(member)
+                    if source is None:
+                        continue
+
+                    with source:
+                        with open(extracted_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
+
+    def is_safe_extract_path(self, destination, target_path):
+        destination = destination.resolve()
+        target_path = target_path.resolve()
+
+        try:
+            target_path.relative_to(destination)
+            return True
+        except ValueError:
+            return False
 
 
 class UpdaterWindow(QWidget):
@@ -268,6 +365,12 @@ class UpdaterWindow(QWidget):
         self.update_now_path = self.base_path / UPDATE_NOW_FILE
         self.auto_update_mode = self.update_now_path.exists()
 
+        try:
+            self.platform_info = current_platform()
+            platform_name = self.platform_info["name"]
+        except Exception:
+            platform_name = platform.system() or "Unknown"
+
         self.setWindowTitle(APP_NAME)
         self.setMinimumWidth(520)
         self.setMinimumHeight(360)
@@ -276,7 +379,7 @@ class UpdaterWindow(QWidget):
         self.title_label.setStyleSheet("font-size: 20px; font-weight: bold;")
 
         self.info_label = QLabel(
-            "This tool checks your installed MiSTer Companion version and downloads the latest Windows build if needed."
+            f"This tool checks your installed MiSTer Companion version and downloads the latest {platform_name} build if needed."
         )
         self.info_label.setWordWrap(True)
 
