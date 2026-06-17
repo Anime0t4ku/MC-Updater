@@ -4,6 +4,7 @@ import platform
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import traceback
@@ -39,6 +40,74 @@ LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
 
 INCLUDE_PRERELEASES = True
 
+
+
+def apply_companion_style(app):
+    app.setStyle("Fusion")
+    app.setStyleSheet(
+        """
+        QWidget {
+            background-color: #120f1c;
+            color: #f2ecff;
+            selection-background-color: #8b5cf6;
+            selection-color: #ffffff;
+        }
+
+        QLabel {
+            background: transparent;
+            color: #f2ecff;
+        }
+
+        QPushButton {
+            background-color: #2b2340;
+            color: #f2ecff;
+            border: 1px solid #5b4a7a;
+            border-radius: 9px;
+            padding: 7px 12px;
+            font-weight: 600;
+        }
+
+        QPushButton:hover {
+            background-color: #3a2f55;
+            border-color: #8b5cf6;
+        }
+
+        QPushButton:pressed {
+            background-color: #4c3b73;
+            border-color: #a78bfa;
+        }
+
+        QPushButton:disabled {
+            background-color: #211b30;
+            color: #8d829e;
+            border-color: #30283f;
+        }
+
+        QTextEdit {
+            background-color: #1b1628;
+            color: #f2ecff;
+            border: 1px solid #3a2f55;
+            border-radius: 9px;
+            padding: 7px;
+            selection-background-color: #8b5cf6;
+            selection-color: #ffffff;
+        }
+
+        QProgressBar {
+            background-color: #1b1628;
+            color: #f2ecff;
+            border: 1px solid #3a2f55;
+            border-radius: 9px;
+            text-align: center;
+            height: 22px;
+        }
+
+        QProgressBar::chunk {
+            background-color: #8b5cf6;
+            border-radius: 8px;
+        }
+        """
+    )
 
 def app_folder():
     if getattr(sys, "frozen", False):
@@ -438,24 +507,79 @@ class UpdaterWindow(QWidget):
     def update_finished(self, message):
         self.append_log(message)
         self.update_button.setEnabled(True)
+        self.close_button.setVisible(True)
 
         if self.auto_update_mode:
             self.remove_update_now_file()
 
-            QMessageBox.information(
-                self,
-                "Update Complete",
-                (
-                    f"{message}\n\n"
-                    "The update has finished successfully.\n\n"
-                    "Press OK to close the updater. You can then start MiSTer Companion again."
-                ),
-            )
+        self.show_update_finished_dialog(message)
 
-            QApplication.quit()
+    def show_update_finished_dialog(self, message):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Update Complete")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setText(message)
+        dialog.setInformativeText("The update process has finished.")
+
+        open_button = dialog.addButton(
+            "Open MiSTer Companion",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        close_button = dialog.addButton(
+            "Close",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        dialog.setDefaultButton(open_button)
+
+        dialog.exec()
+
+        if dialog.clickedButton() == open_button:
+            self.open_mister_companion()
             return
 
-        QMessageBox.information(self, APP_NAME, message)
+        QApplication.quit()
+
+    def open_mister_companion(self):
+        try:
+            target_path = self.base_path / self.platform_info["target_exe"]
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Could not detect platform: {e}")
+            return
+
+        if not target_path.exists():
+            QMessageBox.critical(
+                self,
+                APP_NAME,
+                f"Could not find {target_path.name} next to MC-Updater.",
+            )
+            return
+
+        try:
+            if self.platform_info["name"] == "Linux":
+                make_executable(target_path)
+
+            if self.platform_info["name"] == "Windows":
+                creationflags = 0
+                if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                    creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+                if hasattr(subprocess, "DETACHED_PROCESS"):
+                    creationflags |= subprocess.DETACHED_PROCESS
+
+                subprocess.Popen(
+                    [str(target_path)],
+                    cwd=str(self.base_path),
+                    creationflags=creationflags,
+                )
+            else:
+                subprocess.Popen(
+                    [str(target_path)],
+                    cwd=str(self.base_path),
+                    start_new_session=True,
+                )
+
+            QApplication.quit()
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Could not open MiSTer Companion:\n\n{e}")
 
     def update_failed(self, error):
         self.append_log("Update failed.")
@@ -472,6 +596,7 @@ class UpdaterWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    apply_companion_style(app)
     window = UpdaterWindow()
     window.show()
     sys.exit(app.exec())
