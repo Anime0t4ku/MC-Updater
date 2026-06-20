@@ -41,4 +41,4 @@ You can also run `MC-Updater.exe` manually and press **Check and Update**.
 
 ## Notes
 
-MC-Updater is currently intended for Windows builds only.
+MC-Updater is currently intended for Windows & Linux builds only.
