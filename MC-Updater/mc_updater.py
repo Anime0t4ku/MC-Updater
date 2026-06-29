@@ -38,7 +38,7 @@ UPDATE_NOW_FILE = "updatenow.txt"
 
 WINDOWS_TARGET_EXE = "MiSTer-Companion.exe"
 LINUX_TARGET_EXE = "MiSTer-Companion"
-MACOS_TARGET_APP = "MiSTer Companion.app"
+MACOS_TARGET_APP = "MiSTer-Companion.app"
 
 WINDOWS_ZIP_KEYWORDS = ["Windows", "x86_64", ".zip"]
 LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
@@ -473,12 +473,12 @@ class UpdateWorker(QThread):
             self.log("Mounting macOS DMG...")
             mounted_volume = mount_dmg(dmg_path)
 
-            self.log("Finding MiSTer Companion.app inside the DMG...")
+            self.log("Finding MiSTer-Companion.app inside the DMG...")
             source_app = find_app_in_dmg(mounted_volume, self.platform_info["target_name"])
 
             self.remove_target_for_update(target_path)
 
-            self.log("Copying MiSTer Companion.app...")
+            self.log("Copying MiSTer-Companion.app...")
             shutil.copytree(source_app, target_path, symlinks=True)
         finally:
             if mounted_volume:
