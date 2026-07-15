@@ -1,6 +1,7 @@
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import ssl
@@ -37,9 +38,11 @@ UPDATE_NOW_FILE = "updatenow.txt"
 
 WINDOWS_TARGET_EXE = "MiSTer-Companion.exe"
 LINUX_TARGET_EXE = "MiSTer-Companion"
+MACOS_TARGET_APP = "MiSTer-Companion.app"
 
 WINDOWS_ZIP_KEYWORDS = ["Windows", "x86_64", ".zip"]
 LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
+MACOS_DMG_KEYWORDS = ["macOS", "Apple-Silicon", ".dmg"]
 
 INCLUDE_PRERELEASES = True
 
@@ -112,11 +115,30 @@ def apply_companion_style(app):
         """
     )
 
+
 def app_folder():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
 
     return Path(__file__).resolve().parent
+
+
+def macos_app_container_folder():
+    if getattr(sys, "frozen", False):
+        executable_path = Path(sys.executable).resolve()
+
+        for parent in executable_path.parents:
+            if parent.suffix.lower() == ".app":
+                return parent.parent
+
+    return app_folder()
+
+
+def app_data_folder():
+    if platform.system().lower() == "darwin":
+        return Path.home() / "Library" / "Application Support" / "MiSTer Companion"
+
+    return app_folder()
 
 
 def current_platform():
@@ -125,20 +147,43 @@ def current_platform():
     if system == "windows":
         return {
             "name": "Windows",
-            "target_exe": WINDOWS_TARGET_EXE,
+            "target_name": WINDOWS_TARGET_EXE,
             "asset_keywords": WINDOWS_ZIP_KEYWORDS,
             "archive_type": "zip",
+            "install_folder": app_folder(),
         }
 
     if system == "linux":
         return {
             "name": "Linux",
-            "target_exe": LINUX_TARGET_EXE,
+            "target_name": LINUX_TARGET_EXE,
             "asset_keywords": LINUX_TAR_KEYWORDS,
             "archive_type": "tar.gz",
+            "install_folder": app_folder(),
+        }
+
+    if system == "darwin":
+        machine = platform.machine().lower()
+        if machine not in ("arm64", "aarch64"):
+            raise RuntimeError("macOS Intel is not supported by this updater build.")
+
+        return {
+            "name": "macOS",
+            "target_name": MACOS_TARGET_APP,
+            "asset_keywords": MACOS_DMG_KEYWORDS,
+            "archive_type": "dmg",
+            "install_folder": macos_app_container_folder(),
         }
 
     raise RuntimeError(f"Unsupported operating system: {platform.system()}")
+
+
+def config_path():
+    return app_data_folder() / CONFIG_FILE
+
+
+def update_now_path():
+    return app_data_folder() / UPDATE_NOW_FILE
 
 
 def get_ssl_context():
@@ -162,13 +207,19 @@ def version_to_text(version):
     return f"v{version[0]}.{version[1]}.{version[2]}"
 
 
-def read_current_version(base_path):
-    config_path = base_path / CONFIG_FILE
+def read_current_version():
+    path = config_path()
 
-    if not config_path.exists():
-        raise FileNotFoundError(f"{CONFIG_FILE} was not found next to MC-updater.")
+    if not path.exists():
+        if platform.system().lower() == "darwin":
+            raise FileNotFoundError(
+                f"{CONFIG_FILE} was not found in Application Support. "
+                "Please open MiSTer Companion once before using MC-Updater."
+            )
 
-    with open(config_path, "r", encoding="utf-8") as f:
+        raise FileNotFoundError(f"{CONFIG_FILE} was not found next to MC-Updater.")
+
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     version_text = data.get("app_version")
@@ -271,6 +322,56 @@ def make_executable(path):
     )
 
 
+def remove_existing_target(path):
+    if not path.exists():
+        return
+
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def mount_dmg(dmg_path):
+    result = subprocess.run(
+        ["hdiutil", "attach", str(dmg_path), "-nobrowse", "-readonly", "-plist"],
+        check=True,
+        capture_output=True,
+    )
+    plist = plistlib.loads(result.stdout)
+
+    mount_points = []
+    for entity in plist.get("system-entities", []):
+        mount_point = entity.get("mount-point")
+        if mount_point:
+            mount_points.append(Path(mount_point))
+
+    if not mount_points:
+        raise RuntimeError("The DMG mounted, but no mounted volume could be found.")
+
+    return mount_points[0]
+
+
+def unmount_dmg(mount_point):
+    subprocess.run(
+        ["hdiutil", "detach", str(mount_point), "-quiet"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def find_app_in_dmg(mount_point, app_name):
+    direct_path = mount_point / app_name
+    if direct_path.exists():
+        return direct_path
+
+    matches = list(mount_point.rglob(app_name))
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(f"{app_name} was not found inside the mounted DMG.")
+
+
 class UpdateWorker(QThread):
     status_changed = pyqtSignal(str)
     progress_changed = pyqtSignal(int)
@@ -292,7 +393,7 @@ class UpdateWorker(QThread):
             self.log(f"Detected platform: {self.platform_info['name']}")
 
             self.log("Reading installed version...")
-            current_version_text, current_version = read_current_version(self.base_path)
+            current_version_text, current_version = read_current_version()
             self.log(f"Installed version: {current_version_text}")
 
             self.log("Checking GitHub releases...")
@@ -312,28 +413,22 @@ class UpdateWorker(QThread):
                 raise RuntimeError("The release asset does not have a download URL.")
 
             archive_path = self.base_path / asset_name
-            target_path = self.base_path / self.platform_info["target_exe"]
+            target_path = self.platform_info["install_folder"] / self.platform_info["target_name"]
 
             self.log(f"Downloading {asset_name}...")
             self.download_file(download_url, archive_path)
             self.progress_changed.emit(45)
 
-            if target_path.exists():
-                self.log(f"Removing old {self.platform_info['target_exe']}...")
-                try:
-                    target_path.unlink()
-                except PermissionError:
-                    raise PermissionError(
-                        f"Could not remove {self.platform_info['target_exe']}. "
-                        "Please make sure MiSTer Companion is closed and try again."
-                    )
-
-            self.log("Extracting update...")
+            self.log("Installing update...")
 
             if self.platform_info["archive_type"] == "zip":
-                self.extract_zip(archive_path, self.base_path)
+                self.remove_target_for_update(target_path)
+                self.extract_zip(archive_path, self.platform_info["install_folder"])
             elif self.platform_info["archive_type"] == "tar.gz":
-                self.extract_tar_gz(archive_path, self.base_path)
+                self.remove_target_for_update(target_path)
+                self.extract_tar_gz(archive_path, self.platform_info["install_folder"])
+            elif self.platform_info["archive_type"] == "dmg":
+                self.install_from_dmg(archive_path, target_path)
             else:
                 raise RuntimeError(
                     f"Unsupported archive type: {self.platform_info['archive_type']}"
@@ -357,6 +452,41 @@ class UpdateWorker(QThread):
         except Exception as e:
             error = f"{e}\n\n{traceback.format_exc()}"
             self.failed.emit(error)
+
+    def remove_target_for_update(self, target_path):
+        if not target_path.exists():
+            return
+
+        self.log(f"Removing old {self.platform_info['target_name']}...")
+        try:
+            remove_existing_target(target_path)
+        except PermissionError:
+            raise PermissionError(
+                f"Could not remove {self.platform_info['target_name']}. "
+                "Please make sure MiSTer Companion is closed and try again."
+            )
+
+    def install_from_dmg(self, dmg_path, target_path):
+        mounted_volume = None
+
+        try:
+            self.log("Mounting macOS DMG...")
+            mounted_volume = mount_dmg(dmg_path)
+
+            self.log("Finding MiSTer-Companion.app inside the DMG...")
+            source_app = find_app_in_dmg(mounted_volume, self.platform_info["target_name"])
+
+            self.remove_target_for_update(target_path)
+
+            self.log("Copying MiSTer-Companion.app...")
+            shutil.copytree(source_app, target_path, symlinks=True)
+        finally:
+            if mounted_volume:
+                self.log("Unmounting macOS DMG...")
+                try:
+                    unmount_dmg(mounted_volume)
+                except Exception as e:
+                    self.log(f"Could not unmount DMG automatically: {e}")
 
     def download_file(self, url, destination):
         request = urllib.request.Request(
@@ -446,7 +576,7 @@ class UpdaterWindow(QWidget):
 
         self.worker = None
         self.base_path = app_folder()
-        self.update_now_path = self.base_path / UPDATE_NOW_FILE
+        self.update_now_path = update_now_path()
         self.auto_update_mode = self.update_now_path.exists()
 
         try:
@@ -556,7 +686,7 @@ class UpdaterWindow(QWidget):
 
     def open_mister_companion(self):
         try:
-            target_path = self.base_path / self.platform_info["target_exe"]
+            target_path = self.platform_info["install_folder"] / self.platform_info["target_name"]
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Could not detect platform: {e}")
             return
@@ -582,13 +712,19 @@ class UpdaterWindow(QWidget):
 
                 subprocess.Popen(
                     [str(target_path)],
-                    cwd=str(self.base_path),
+                    cwd=str(self.platform_info["install_folder"]),
                     creationflags=creationflags,
+                )
+            elif self.platform_info["name"] == "macOS":
+                subprocess.Popen(
+                    ["open", str(target_path)],
+                    cwd=str(self.platform_info["install_folder"]),
+                    start_new_session=True,
                 )
             else:
                 subprocess.Popen(
                     [str(target_path)],
-                    cwd=str(self.base_path),
+                    cwd=str(self.platform_info["install_folder"]),
                     start_new_session=True,
                 )
 
