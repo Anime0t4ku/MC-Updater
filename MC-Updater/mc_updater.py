@@ -37,14 +37,9 @@ UPDATE_NOW_FILE = "updatenow.txt"
 
 WINDOWS_TARGET_EXE = "MiSTer-Companion.exe"
 LINUX_TARGET_EXE = "MiSTer-Companion"
-MACOS_TARGET_APP = "MiSTer-Companion.app"
 
-WINDOWS_X64_ASSET = "MiSTer-Companion-Windows-x86_64.zip"
-WINDOWS_ARM64_ASSET = "MiSTer-Companion-Windows-ARM64.zip"
-LINUX_X64_ASSET = "MiSTer-Companion-Linux-x86_64.tar.gz"
-LINUX_ARM64_ASSET = "MiSTer-Companion-Linux-ARM64.tar.gz"
-MACOS_APPLE_SILICON_ASSET = "MiSTer-Companion-macOS-Apple-Silicon.dmg"
-MACOS_INTEL_ASSET = "MiSTer-Companion-macOS-Intel.dmg"
+WINDOWS_ZIP_KEYWORDS = ["Windows", "x86_64", ".zip"]
+LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
 
 INCLUDE_PRERELEASES = True
 
@@ -124,50 +119,23 @@ def app_folder():
     return Path(__file__).resolve().parent
 
 
-def normalized_architecture():
-    machine = platform.machine().strip().lower()
-
-    if machine in {"amd64", "x86_64", "x64"}:
-        return "x86_64"
-
-    if machine in {"arm64", "aarch64"}:
-        return "arm64"
-
-    raise RuntimeError(f"Unsupported CPU architecture: {platform.machine()}")
-
-
 def current_platform():
     system = platform.system().lower()
-    architecture = normalized_architecture()
 
     if system == "windows":
-        asset_name = WINDOWS_ARM64_ASSET if architecture == "arm64" else WINDOWS_X64_ASSET
         return {
             "name": "Windows",
-            "architecture": architecture,
             "target_exe": WINDOWS_TARGET_EXE,
-            "asset_name": asset_name,
+            "asset_keywords": WINDOWS_ZIP_KEYWORDS,
             "archive_type": "zip",
         }
 
     if system == "linux":
-        asset_name = LINUX_ARM64_ASSET if architecture == "arm64" else LINUX_X64_ASSET
         return {
             "name": "Linux",
-            "architecture": architecture,
             "target_exe": LINUX_TARGET_EXE,
-            "asset_name": asset_name,
+            "asset_keywords": LINUX_TAR_KEYWORDS,
             "archive_type": "tar.gz",
-        }
-
-    if system == "darwin":
-        asset_name = MACOS_APPLE_SILICON_ASSET if architecture == "arm64" else MACOS_INTEL_ASSET
-        return {
-            "name": "macOS",
-            "architecture": architecture,
-            "target_app": MACOS_TARGET_APP,
-            "asset_name": asset_name,
-            "archive_type": "dmg",
         }
 
     raise RuntimeError(f"Unsupported operating system: {platform.system()}")
@@ -230,7 +198,13 @@ def github_api_json(url):
 
 
 def asset_matches_platform(asset_name, platform_info):
-    return asset_name.casefold() == platform_info["asset_name"].casefold()
+    lowered = asset_name.lower()
+
+    for keyword in platform_info["asset_keywords"]:
+        if keyword.lower() not in lowered:
+            return False
+
+    return True
 
 
 def find_latest_release(platform_info):
@@ -277,7 +251,7 @@ def find_latest_release(platform_info):
 
     if not best_release or not best_version or not best_asset:
         raise RuntimeError(
-            f"Could not find release asset {platform_info['asset_name']}."
+            f"Could not find a valid MiSTer Companion {platform_info['name']} release asset."
         )
 
     return best_release, best_version, best_asset
@@ -295,63 +269,6 @@ def make_executable(path):
         | stat.S_IXGRP
         | stat.S_IXOTH,
     )
-
-
-def mounted_volume_for_dmg(dmg_path):
-    import plistlib
-
-    result = subprocess.run(
-        ["hdiutil", "attach", str(dmg_path), "-nobrowse", "-readonly", "-plist"],
-        check=True,
-        capture_output=True,
-    )
-    data = plistlib.loads(result.stdout)
-    for entity in data.get("system-entities", []):
-        mount_point = entity.get("mount-point")
-        if mount_point:
-            return Path(mount_point)
-
-    raise RuntimeError("The DMG mounted, but no volume mount point was returned.")
-
-
-def detach_dmg(mount_point):
-    subprocess.run(
-        ["hdiutil", "detach", str(mount_point), "-force"],
-        check=False,
-        capture_output=True,
-    )
-
-
-def install_macos_app(dmg_path):
-    mount_point = mounted_volume_for_dmg(dmg_path)
-
-    try:
-        source_app = mount_point / MACOS_TARGET_APP
-        if not source_app.exists():
-            candidates = list(mount_point.glob("*.app"))
-            if len(candidates) == 1:
-                source_app = candidates[0]
-            else:
-                raise FileNotFoundError(
-                    f"{MACOS_TARGET_APP} was not found in the mounted DMG."
-                )
-
-        applications_dir = Path("/Applications")
-        destination_app = applications_dir / MACOS_TARGET_APP
-
-        if not os.access(applications_dir, os.W_OK):
-            raise PermissionError(
-                "MC-Updater cannot write to /Applications. "
-                "Please allow it to replace MiSTer Companion and try again."
-            )
-
-        if destination_app.exists():
-            shutil.rmtree(destination_app)
-
-        shutil.copytree(source_app, destination_app, symlinks=True)
-        return destination_app
-    finally:
-        detach_dmg(mount_point)
 
 
 class UpdateWorker(QThread):
@@ -372,17 +289,7 @@ class UpdateWorker(QThread):
         try:
             self.progress_changed.emit(0)
 
-            architecture_label = (
-                "Apple Silicon"
-                if self.platform_info["name"] == "macOS"
-                and self.platform_info["architecture"] == "arm64"
-                else "Intel"
-                if self.platform_info["name"] == "macOS"
-                else "ARM64"
-                if self.platform_info["architecture"] == "arm64"
-                else "x86_64"
-            )
-            self.log(f"Detected platform: {self.platform_info['name']} {architecture_label}")
+            self.log(f"Detected platform: {self.platform_info['name']}")
 
             self.log("Reading installed version...")
             current_version_text, current_version = read_current_version(self.base_path)
@@ -405,43 +312,38 @@ class UpdateWorker(QThread):
                 raise RuntimeError("The release asset does not have a download URL.")
 
             archive_path = self.base_path / asset_name
+            target_path = self.base_path / self.platform_info["target_exe"]
 
             self.log(f"Downloading {asset_name}...")
             self.download_file(download_url, archive_path)
             self.progress_changed.emit(45)
 
-            if self.platform_info["name"] == "macOS":
-                self.log("Installing MiSTer Companion in /Applications...")
-                target_path = install_macos_app(archive_path)
-            else:
-                target_path = self.base_path / self.platform_info["target_exe"]
-
-                if target_path.exists():
-                    self.log(f"Removing old {self.platform_info['target_exe']}...")
-                    try:
-                        target_path.unlink()
-                    except PermissionError:
-                        raise PermissionError(
-                            f"Could not remove {self.platform_info['target_exe']}. "
-                            "Please make sure MiSTer Companion is closed and try again."
-                        )
-
-                self.log("Extracting update...")
-
-                if self.platform_info["archive_type"] == "zip":
-                    self.extract_zip(archive_path, self.base_path)
-                elif self.platform_info["archive_type"] == "tar.gz":
-                    self.extract_tar_gz(archive_path, self.base_path)
-                else:
-                    raise RuntimeError(
-                        f"Unsupported archive type: {self.platform_info['archive_type']}"
+            if target_path.exists():
+                self.log(f"Removing old {self.platform_info['target_exe']}...")
+                try:
+                    target_path.unlink()
+                except PermissionError:
+                    raise PermissionError(
+                        f"Could not remove {self.platform_info['target_exe']}. "
+                        "Please make sure MiSTer Companion is closed and try again."
                     )
 
-                if self.platform_info["name"] == "Linux":
-                    self.log("Making Linux executable runnable...")
-                    make_executable(target_path)
+            self.log("Extracting update...")
+
+            if self.platform_info["archive_type"] == "zip":
+                self.extract_zip(archive_path, self.base_path)
+            elif self.platform_info["archive_type"] == "tar.gz":
+                self.extract_tar_gz(archive_path, self.base_path)
+            else:
+                raise RuntimeError(
+                    f"Unsupported archive type: {self.platform_info['archive_type']}"
+                )
 
             self.progress_changed.emit(85)
+
+            if self.platform_info["name"] == "Linux":
+                self.log("Making Linux executable runnable...")
+                make_executable(target_path)
 
             self.log("Removing downloaded archive file...")
             try:
@@ -654,10 +556,7 @@ class UpdaterWindow(QWidget):
 
     def open_mister_companion(self):
         try:
-            if self.platform_info["name"] == "macOS":
-                target_path = Path("/Applications") / self.platform_info["target_app"]
-            else:
-                target_path = self.base_path / self.platform_info["target_exe"]
+            target_path = self.base_path / self.platform_info["target_exe"]
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Could not detect platform: {e}")
             return
@@ -685,11 +584,6 @@ class UpdaterWindow(QWidget):
                     [str(target_path)],
                     cwd=str(self.base_path),
                     creationflags=creationflags,
-                )
-            elif self.platform_info["name"] == "macOS":
-                subprocess.Popen(
-                    ["open", "-a", str(target_path)],
-                    start_new_session=True,
                 )
             else:
                 subprocess.Popen(
