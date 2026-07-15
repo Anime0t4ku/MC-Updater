@@ -40,9 +40,12 @@ WINDOWS_TARGET_EXE = "MiSTer-Companion.exe"
 LINUX_TARGET_EXE = "MiSTer-Companion"
 MACOS_TARGET_APP = "MiSTer-Companion.app"
 
-WINDOWS_ZIP_KEYWORDS = ["Windows", "x86_64", ".zip"]
-LINUX_TAR_KEYWORDS = ["Linux", "x86_64", ".tar.gz"]
-MACOS_DMG_KEYWORDS = ["macOS", "Apple-Silicon", ".dmg"]
+WINDOWS_X64_ASSET = "MiSTer-Companion-Windows-x86_64.zip"
+WINDOWS_ARM64_ASSET = "MiSTer-Companion-Windows-ARM64.zip"
+LINUX_X64_ASSET = "MiSTer-Companion-Linux-x86_64.tar.gz"
+LINUX_ARM64_ASSET = "MiSTer-Companion-Linux-ARM64.tar.gz"
+MACOS_APPLE_SILICON_ASSET = "MiSTer-Companion-macOS-Apple-Silicon.dmg"
+MACOS_INTEL_ASSET = "MiSTer-Companion-macOS-Intel.dmg"
 
 INCLUDE_PRERELEASES = True
 
@@ -141,36 +144,63 @@ def app_data_folder():
     return app_folder()
 
 
+def normalized_architecture():
+    machine = platform.machine().strip().lower()
+
+    if machine in {"amd64", "x86_64", "x64"}:
+        return "x86_64"
+
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+
+    raise RuntimeError(f"Unsupported CPU architecture: {platform.machine()}")
+
+
 def current_platform():
     system = platform.system().lower()
+    architecture = normalized_architecture()
 
     if system == "windows":
+        asset_name = (
+            WINDOWS_ARM64_ASSET
+            if architecture == "arm64"
+            else WINDOWS_X64_ASSET
+        )
         return {
             "name": "Windows",
+            "architecture": architecture,
             "target_name": WINDOWS_TARGET_EXE,
-            "asset_keywords": WINDOWS_ZIP_KEYWORDS,
+            "asset_name": asset_name,
             "archive_type": "zip",
             "install_folder": app_folder(),
         }
 
     if system == "linux":
+        asset_name = (
+            LINUX_ARM64_ASSET
+            if architecture == "arm64"
+            else LINUX_X64_ASSET
+        )
         return {
             "name": "Linux",
+            "architecture": architecture,
             "target_name": LINUX_TARGET_EXE,
-            "asset_keywords": LINUX_TAR_KEYWORDS,
+            "asset_name": asset_name,
             "archive_type": "tar.gz",
             "install_folder": app_folder(),
         }
 
     if system == "darwin":
-        machine = platform.machine().lower()
-        if machine not in ("arm64", "aarch64"):
-            raise RuntimeError("macOS Intel is not supported by this updater build.")
-
+        asset_name = (
+            MACOS_APPLE_SILICON_ASSET
+            if architecture == "arm64"
+            else MACOS_INTEL_ASSET
+        )
         return {
             "name": "macOS",
+            "architecture": architecture,
             "target_name": MACOS_TARGET_APP,
-            "asset_keywords": MACOS_DMG_KEYWORDS,
+            "asset_name": asset_name,
             "archive_type": "dmg",
             "install_folder": macos_app_container_folder(),
         }
@@ -249,13 +279,7 @@ def github_api_json(url):
 
 
 def asset_matches_platform(asset_name, platform_info):
-    lowered = asset_name.lower()
-
-    for keyword in platform_info["asset_keywords"]:
-        if keyword.lower() not in lowered:
-            return False
-
-    return True
+    return asset_name.casefold() == platform_info["asset_name"].casefold()
 
 
 def find_latest_release(platform_info):
@@ -302,7 +326,7 @@ def find_latest_release(platform_info):
 
     if not best_release or not best_version or not best_asset:
         raise RuntimeError(
-            f"Could not find a valid MiSTer Companion {platform_info['name']} release asset."
+            f"Could not find release asset {platform_info['asset_name']}."
         )
 
     return best_release, best_version, best_asset
@@ -390,7 +414,19 @@ class UpdateWorker(QThread):
         try:
             self.progress_changed.emit(0)
 
-            self.log(f"Detected platform: {self.platform_info['name']}")
+            architecture_label = (
+                "Apple Silicon"
+                if self.platform_info["name"] == "macOS"
+                and self.platform_info["architecture"] == "arm64"
+                else "Intel"
+                if self.platform_info["name"] == "macOS"
+                else "ARM64"
+                if self.platform_info["architecture"] == "arm64"
+                else "x86_64"
+            )
+            self.log(
+                f"Detected platform: {self.platform_info['name']} {architecture_label}"
+            )
 
             self.log("Reading installed version...")
             current_version_text, current_version = read_current_version()
@@ -581,7 +617,19 @@ class UpdaterWindow(QWidget):
 
         try:
             self.platform_info = current_platform()
-            platform_name = self.platform_info["name"]
+            if self.platform_info["name"] == "macOS":
+                architecture_name = (
+                    "Apple Silicon"
+                    if self.platform_info["architecture"] == "arm64"
+                    else "Intel"
+                )
+            else:
+                architecture_name = (
+                    "ARM64"
+                    if self.platform_info["architecture"] == "arm64"
+                    else "x86_64"
+                )
+            platform_name = f"{self.platform_info['name']} {architecture_name}"
         except Exception:
             platform_name = platform.system() or "Unknown"
 

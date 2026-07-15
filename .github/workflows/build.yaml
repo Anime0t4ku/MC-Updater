@@ -9,11 +9,20 @@ permissions:
 
 jobs:
   # ============================================================
-  # Windows Build
+  # Windows Builds
   # ============================================================
   build-windows:
-    name: Build Windows Executable
-    runs-on: windows-latest
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: ARM64
+            runner: windows-11-arm
 
     steps:
       - name: Checkout Repository
@@ -24,10 +33,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Confirm Architecture
+        shell: python
+        run: |
+          import platform
+          print(platform.platform())
+          print(platform.machine())
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 certifi
+          python -m pip install pyinstaller PyQt6 certifi
 
       - name: List Files
         working-directory: MC-Updater
@@ -39,18 +55,35 @@ jobs:
         working-directory: MC-Updater
         run: pyinstaller --clean --onefile --windowed --name MC-Updater mc_updater.py
 
+      - name: Package Windows Build
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "MC-Updater/dist/MC-Updater.exe" `
+            -DestinationPath "MC-Updater-Windows-${{ matrix.arch }}.zip" `
+            -Force
+
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MC-Updater-Windows-x86_64
-          path: MC-Updater/dist/MC-Updater.exe
+          name: MC-Updater-Windows-${{ matrix.arch }}
+          path: MC-Updater-Windows-${{ matrix.arch }}.zip
 
   # ============================================================
-  # Linux Build
+  # Linux Builds
   # ============================================================
   build-linux:
-    name: Build Linux Executable
-    runs-on: ubuntu-latest
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: ARM64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout Repository
@@ -61,6 +94,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Confirm Architecture
+        run: |
+          python -c "import platform; print(platform.platform()); print(platform.machine())"
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -69,7 +106,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 certifi
+          python -m pip install pyinstaller PyQt6 certifi
 
       - name: List Files
         working-directory: MC-Updater
@@ -81,21 +118,36 @@ jobs:
         working-directory: MC-Updater
         run: pyinstaller --clean --onefile --windowed --name MC-Updater mc_updater.py
 
-      - name: Make Executable
-        run: chmod +x MC-Updater/dist/MC-Updater
+      - name: Package Linux Build
+        run: |
+          chmod +x MC-Updater/dist/MC-Updater
+          tar -C MC-Updater/dist \
+            -czf "MC-Updater-Linux-${{ matrix.arch }}.tar.gz" \
+            MC-Updater
 
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MC-Updater-Linux-x86_64
-          path: MC-Updater/dist/MC-Updater
+          name: MC-Updater-Linux-${{ matrix.arch }}
+          path: MC-Updater-Linux-${{ matrix.arch }}.tar.gz
 
   # ============================================================
-  # macOS Apple Silicon Build
+  # macOS Builds
   # ============================================================
   build-macos:
-    name: Build macOS Apple Silicon DMG
-    runs-on: macos-14
+    name: Build macOS ${{ matrix.package_arch }} DMG
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_arch: Apple-Silicon
+            expected_arch: arm64
+            runner: macos-14
+          - package_arch: Intel
+            expected_arch: x86_64
+            runner: macos-15-intel
 
     steps:
       - name: Checkout Repository
@@ -113,7 +165,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 certifi
+          python -m pip install pyinstaller PyQt6 certifi
 
       - name: List Files
         working-directory: MC-Updater
@@ -125,6 +177,14 @@ jobs:
         working-directory: MC-Updater
         run: |
           pyinstaller --clean --windowed --name MC-Updater mc_updater.py
+
+      - name: Verify App Architecture
+        working-directory: MC-Updater
+        run: |
+          file "dist/MC-Updater.app/Contents/MacOS/MC-Updater"
+          ARCHS="$(lipo -archs "dist/MC-Updater.app/Contents/MacOS/MC-Updater")"
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw "${{ matrix.expected_arch }}"
 
       - name: Import Developer ID Certificate
         env:
@@ -174,16 +234,17 @@ jobs:
             -srcfolder "dmg-root" \
             -ov \
             -format UDZO \
-            "dist/MC-Updater-macOS-Apple-Silicon.dmg"
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
 
       - name: Sign macOS DMG
         working-directory: MC-Updater
         run: |
           codesign --force --timestamp \
             --sign "Developer ID Application: Bjorn Logan (SMNGA44VUR)" \
-            "dist/MC-Updater-macOS-Apple-Silicon.dmg"
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
 
-          codesign --verify --verbose=2 "dist/MC-Updater-macOS-Apple-Silicon.dmg"
+          codesign --verify --verbose=2 \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
 
       - name: Notarize macOS DMG
         working-directory: MC-Updater
@@ -192,7 +253,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          xcrun notarytool submit "dist/MC-Updater-macOS-Apple-Silicon.dmg" \
+          xcrun notarytool submit \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
@@ -201,14 +263,16 @@ jobs:
       - name: Staple macOS DMG
         working-directory: MC-Updater
         run: |
-          xcrun stapler staple "dist/MC-Updater-macOS-Apple-Silicon.dmg"
-          xcrun stapler validate "dist/MC-Updater-macOS-Apple-Silicon.dmg"
+          xcrun stapler staple \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+          xcrun stapler validate \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MC-Updater-macOS-Apple-Silicon
-          path: MC-Updater/dist/MC-Updater-macOS-Apple-Silicon.dmg
+          name: MC-Updater-macOS-${{ matrix.package_arch }}
+          path: MC-Updater/dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg
 
   # ============================================================
   # Pre-release Creation
@@ -231,27 +295,21 @@ jobs:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: release-assets
           merge-multiple: true
 
       - name: List Downloaded Artifacts
         run: |
-          find dist -maxdepth 2 -type f -print
+          find release-assets -maxdepth 2 -type f -print
 
-      - name: Zip Windows Build
+      - name: Verify Release Files
         run: |
-          cd dist
-          zip ../MC-Updater-Windows-x86_64.zip MC-Updater.exe
-
-      - name: Tar Linux Build
-        run: |
-          cd dist
-          chmod +x MC-Updater
-          tar -czf ../MC-Updater-Linux-x86_64.tar.gz MC-Updater
-
-      - name: Copy macOS DMG
-        run: |
-          cp dist/MC-Updater-macOS-Apple-Silicon.dmg ./MC-Updater-macOS-Apple-Silicon.dmg
+          test -f release-assets/MC-Updater-Windows-x86_64.zip
+          test -f release-assets/MC-Updater-Windows-ARM64.zip
+          test -f release-assets/MC-Updater-Linux-x86_64.tar.gz
+          test -f release-assets/MC-Updater-Linux-ARM64.tar.gz
+          test -f release-assets/MC-Updater-macOS-Apple-Silicon.dmg
+          test -f release-assets/MC-Updater-macOS-Intel.dmg
 
       - name: Update Git Tag
         run: |
@@ -267,6 +325,9 @@ jobs:
           replacesArtifacts: true
           tag: Pre-release
           artifacts: |
-            MC-Updater-Windows-x86_64.zip
-            MC-Updater-Linux-x86_64.tar.gz
-            MC-Updater-macOS-Apple-Silicon.dmg
+            release-assets/MC-Updater-Windows-x86_64.zip
+            release-assets/MC-Updater-Windows-ARM64.zip
+            release-assets/MC-Updater-Linux-x86_64.tar.gz
+            release-assets/MC-Updater-Linux-ARM64.tar.gz
+            release-assets/MC-Updater-macOS-Apple-Silicon.dmg
+            release-assets/MC-Updater-macOS-Intel.dmg
