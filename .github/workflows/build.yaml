@@ -1,19 +1,33 @@
 name: MC-Updater
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   # ============================================================
-  # Windows Build
+  # Windows Builds (x86_64 + ARM64)
   # ============================================================
   build-windows:
-    name: Build Windows Executable
-    runs-on: windows-latest
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: ARM64
+            runner: windows-11-arm
 
     steps:
       - name: Checkout Repository
@@ -24,33 +38,51 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify Native Architecture
+        shell: python
+        run: |
+          import platform
+          print("Platform:", platform.platform())
+          print("Machine:", platform.machine())
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 certifi
-
-      - name: List Files
-        working-directory: MC-Updater
-        run: |
-          pwd
-          dir
+          python -m pip install pyinstaller PyQt6 certifi
 
       - name: Build Executable
         working-directory: MC-Updater
         run: pyinstaller --clean --onefile --windowed --name MC-Updater mc_updater.py
 
+      - name: Package Windows Build
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "MC-Updater/dist/MC-Updater.exe" `
+            -DestinationPath "MC-Updater-Windows-${{ matrix.arch }}.zip" `
+            -Force
+
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MC-Updater-Windows-x86_64
-          path: MC-Updater/dist/MC-Updater.exe
+          name: MC-Updater-Windows-${{ matrix.arch }}
+          path: MC-Updater-Windows-${{ matrix.arch }}.zip
 
   # ============================================================
-  # Linux Build
+  # Linux Builds (x86_64 + ARM64)
   # ============================================================
   build-linux:
-    name: Build Linux Executable
-    runs-on: ubuntu-latest
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: ARM64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout Repository
@@ -60,6 +92,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify Native Architecture
+        run: |
+          python -c "import platform; print(platform.platform()); print(platform.machine())"
 
       - name: Install System Dependencies
         run: |
@@ -69,26 +105,166 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller PyQt6 certifi
-
-      - name: List Files
-        working-directory: MC-Updater
-        run: |
-          pwd
-          ls -la
+          python -m pip install pyinstaller PyQt6 certifi
 
       - name: Build Executable
         working-directory: MC-Updater
         run: pyinstaller --clean --onefile --windowed --name MC-Updater mc_updater.py
 
-      - name: Make Executable
-        run: chmod +x MC-Updater/dist/MC-Updater
+      - name: Package Linux Build
+        run: |
+          chmod +x MC-Updater/dist/MC-Updater
+          tar -C MC-Updater/dist \
+            -czf "MC-Updater-Linux-${{ matrix.arch }}.tar.gz" \
+            MC-Updater
 
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MC-Updater-Linux-x86_64
-          path: MC-Updater/dist/MC-Updater
+          name: MC-Updater-Linux-${{ matrix.arch }}
+          path: MC-Updater-Linux-${{ matrix.arch }}.tar.gz
+
+  # ============================================================
+  # macOS Builds (Apple Silicon + Intel)
+  # ============================================================
+  build-macos:
+    name: Build macOS ${{ matrix.package_arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_arch: Apple-Silicon
+            expected_arch: arm64
+            runner: macos-15
+          - package_arch: Intel
+            expected_arch: x86_64
+            runner: macos-15-intel
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify Native Architecture
+        run: |
+          python -c "import platform; print(platform.platform()); print(platform.machine())"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller PyQt6 certifi
+
+      - name: Build App Bundle
+        working-directory: MC-Updater
+        run: pyinstaller --clean --windowed --name MC-Updater mc_updater.py
+
+      - name: Verify App Bundle Architecture
+        working-directory: MC-Updater
+        run: |
+          file "dist/MC-Updater.app/Contents/MacOS/MC-Updater"
+          ARCHS="$(lipo -archs "dist/MC-Updater.app/Contents/MacOS/MC-Updater")"
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw "${{ matrix.expected_arch }}"
+
+      - name: Import Developer ID Certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer_id_application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_CERTIFICATE_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Sign App Bundle
+        working-directory: MC-Updater
+        run: |
+          codesign --force --deep --options runtime --timestamp \
+            --sign "Developer ID Application: Bjorn Logan (SMNGA44VUR)" \
+            "dist/MC-Updater.app"
+
+          codesign --verify --deep --strict --verbose=2 \
+            "dist/MC-Updater.app"
+
+      - name: Create macOS DMG
+        working-directory: MC-Updater
+        run: |
+          mkdir -p dmg-root
+          cp -R "dist/MC-Updater.app" "dmg-root/"
+          ln -s /Applications "dmg-root/Applications"
+
+          hdiutil create \
+            -volname "MC-Updater" \
+            -srcfolder "dmg-root" \
+            -ov \
+            -format UDZO \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+
+      - name: Sign macOS DMG
+        working-directory: MC-Updater
+        run: |
+          codesign --force --timestamp \
+            --sign "Developer ID Application: Bjorn Logan (SMNGA44VUR)" \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+
+          codesign --verify --verbose=2 \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+
+      - name: Notarize macOS DMG
+        working-directory: MC-Updater
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          xcrun notarytool submit \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Staple macOS DMG
+        working-directory: MC-Updater
+        run: |
+          xcrun stapler staple \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+
+          xcrun stapler validate \
+            "dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg"
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MC-Updater-macOS-${{ matrix.package_arch }}
+          path: MC-Updater/dist/MC-Updater-macOS-${{ matrix.package_arch }}.dmg
 
   # ============================================================
   # Pre-release Creation
@@ -99,6 +275,7 @@ jobs:
     needs:
       - build-windows
       - build-linux
+      - build-macos
     if: github.ref == 'refs/heads/main'
 
     steps:
@@ -110,23 +287,18 @@ jobs:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: release-assets
           merge-multiple: true
 
-      - name: List Downloaded Artifacts
+      - name: Verify Release Packages
         run: |
-          find dist -maxdepth 2 -type f -print
-
-      - name: Zip Windows Build
-        run: |
-          cd dist
-          zip ../MC-Updater-Windows-x86_64.zip MC-Updater.exe
-
-      - name: Tar Linux Build
-        run: |
-          cd dist
-          chmod +x MC-Updater
-          tar -czf ../MC-Updater-Linux-x86_64.tar.gz MC-Updater
+          ls -lh release-assets
+          test -f release-assets/MC-Updater-Windows-x86_64.zip
+          test -f release-assets/MC-Updater-Windows-ARM64.zip
+          test -f release-assets/MC-Updater-Linux-x86_64.tar.gz
+          test -f release-assets/MC-Updater-Linux-ARM64.tar.gz
+          test -f release-assets/MC-Updater-macOS-Apple-Silicon.dmg
+          test -f release-assets/MC-Updater-macOS-Intel.dmg
 
       - name: Update Git Tag
         run: |
@@ -142,5 +314,9 @@ jobs:
           replacesArtifacts: true
           tag: Pre-release
           artifacts: |
-            MC-Updater-Windows-x86_64.zip
-            MC-Updater-Linux-x86_64.tar.gz
+            release-assets/MC-Updater-Windows-x86_64.zip
+            release-assets/MC-Updater-Windows-ARM64.zip
+            release-assets/MC-Updater-Linux-x86_64.tar.gz
+            release-assets/MC-Updater-Linux-ARM64.tar.gz
+            release-assets/MC-Updater-macOS-Apple-Silicon.dmg
+            release-assets/MC-Updater-macOS-Intel.dmg
