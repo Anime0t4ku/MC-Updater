@@ -44,6 +44,8 @@ WINDOWS_X64_ASSET = "MiSTer-Companion-Windows-x86_64.zip"
 WINDOWS_ARM64_ASSET = "MiSTer-Companion-Windows-ARM64.zip"
 LINUX_X64_ASSET = "MiSTer-Companion-Linux-x86_64.tar.gz"
 LINUX_ARM64_ASSET = "MiSTer-Companion-Linux-ARM64.tar.gz"
+LINUX_X64_APPIMAGE_ASSET = "MiSTer-Companion-Linux-x86_64.AppImage"
+LINUX_ARM64_APPIMAGE_ASSET = "MiSTer-Companion-Linux-ARM64.AppImage"
 MACOS_APPLE_SILICON_ASSET = "MiSTer-Companion-macOS-Apple-Silicon.dmg"
 MACOS_INTEL_ASSET = "MiSTer-Companion-macOS-Intel.dmg"
 
@@ -176,6 +178,27 @@ def current_platform():
         }
 
     if system == "linux":
+        appimage = appimage_target()
+
+        if appimage:
+            asset_name = (
+                LINUX_ARM64_APPIMAGE_ASSET
+                if architecture == "arm64"
+                else LINUX_X64_APPIMAGE_ASSET
+            )
+            return {
+                "name": "Linux",
+                "architecture": architecture,
+                # Keep the name the user gave the file.
+                "target_name": appimage.name,
+                "asset_name": asset_name,
+                "archive_type": "appimage",
+                # An AppImage mount is read only, so app_folder() is not a
+                # place anything can be installed. The folder holding the
+                # .AppImage is the install.
+                "install_folder": appimage.parent,
+            }
+
         asset_name = (
             LINUX_ARM64_ASSET
             if architecture == "arm64"
@@ -214,6 +237,23 @@ def config_path():
 
 def update_now_path():
     return app_data_folder() / UPDATE_NOW_FILE
+
+
+def appimage_target():
+    # MiSTer Companion writes the path of the running .AppImage into
+    # updatenow.txt before it starts us. $APPIMAGE cannot be used instead: it
+    # is inherited by every child process, so it would be set for an unrelated
+    # build started from an AppImage terminal, and unset when MC-Updater is
+    # started on its own.
+    try:
+        text = update_now_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    if not text.lower().endswith(".appimage"):
+        return None
+
+    return Path(text)
 
 
 def get_ssl_context():
@@ -448,11 +488,31 @@ class UpdateWorker(QThread):
             if not download_url:
                 raise RuntimeError("The release asset does not have a download URL.")
 
-            archive_path = self.base_path / asset_name
             target_path = self.platform_info["install_folder"] / self.platform_info["target_name"]
 
+            if self.platform_info["archive_type"] == "appimage":
+                # Download beside the .AppImage so the swap below is a rename
+                # within one filesystem.
+                archive_path = target_path.with_name(target_path.name + ".new")
+            else:
+                archive_path = self.base_path / asset_name
+
+            if self.platform_info["name"] == "Linux" and not target_path.exists():
+                raise RuntimeError(
+                    f"{target_path.name} was not found in {target_path.parent}. "
+                    "If you run the AppImage build, start the update from the "
+                    "App Settings tab in MiSTer Companion so it can tell "
+                    "MC-Updater where the .AppImage is."
+                )
+
             self.log(f"Downloading {asset_name}...")
-            self.download_file(download_url, archive_path)
+            try:
+                self.download_file(download_url, archive_path)
+            except Exception:
+                # A part file left beside the user's .AppImage looks like a
+                # second copy of the app.
+                archive_path.unlink(missing_ok=True)
+                raise
             self.progress_changed.emit(45)
 
             self.log("Installing update...")
@@ -463,6 +523,8 @@ class UpdateWorker(QThread):
             elif self.platform_info["archive_type"] == "tar.gz":
                 self.remove_target_for_update(target_path)
                 self.extract_tar_gz(archive_path, self.platform_info["install_folder"])
+            elif self.platform_info["archive_type"] == "appimage":
+                self.install_appimage(archive_path, target_path)
             elif self.platform_info["archive_type"] == "dmg":
                 self.install_from_dmg(archive_path, target_path)
             else:
@@ -476,11 +538,12 @@ class UpdateWorker(QThread):
                 self.log("Making Linux executable runnable...")
                 make_executable(target_path)
 
-            self.log("Removing downloaded archive file...")
-            try:
-                archive_path.unlink()
-            except Exception:
-                pass
+            if self.platform_info["archive_type"] != "appimage":
+                self.log("Removing downloaded archive file...")
+                try:
+                    archive_path.unlink()
+                except Exception:
+                    pass
 
             self.progress_changed.emit(100)
             self.finished_ok.emit(f"MiSTer Companion was updated to {latest_version_text}.")
@@ -501,6 +564,15 @@ class UpdateWorker(QThread):
                 f"Could not remove {self.platform_info['target_name']}. "
                 "Please make sure MiSTer Companion is closed and try again."
             )
+
+    def install_appimage(self, downloaded_path, target_path):
+        # An AppImage is one file, so replace it instead of removing it and
+        # unpacking over the top. os.replace() is atomic, and it keeps the old
+        # inode alive for a MiSTer Companion that is still shutting down,
+        # which would otherwise lose the mount it is running from.
+        self.log(f"Replacing {target_path.name}...")
+        make_executable(downloaded_path)
+        os.replace(downloaded_path, target_path)
 
     def install_from_dmg(self, dmg_path, target_path):
         mounted_volume = None
